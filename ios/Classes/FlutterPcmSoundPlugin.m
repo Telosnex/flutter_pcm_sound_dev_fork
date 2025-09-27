@@ -28,6 +28,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 
 // We’ll track the chosen audio category to know if we should override the speaker
 @property(nonatomic, copy) NSString *chosenCategory;
+@property(nonatomic) BOOL hasSpeakerOverride;
 
 @end
 
@@ -45,6 +46,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     instance.mFeedThreshold = 8000;
     instance.mDidInvokeFeedCallback = false;
     instance.mDidSetup = false;
+    instance.hasSpeakerOverride = NO;
 
     [registrar addMethodCallDelegate:instance channel:methodChannel];
 }
@@ -70,6 +72,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 #if TARGET_OS_IOS
             NSString *iosAudioCategory = args[@"ios_audio_category"];
             self.chosenCategory = iosAudioCategory;
+            self.hasSpeakerOverride = NO;
 #endif
 
             self.mNumChannels = [numChannels intValue];
@@ -78,6 +81,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 	        // handle background audio in iOS
             // Default to Playback if no matching case is found
             AVAudioSessionCategory category = AVAudioSessionCategoryPlayback;
+            AVAudioSessionCategoryOptions options = 0;
             if ([iosAudioCategory isEqualToString:@"ambient"]) {
                 category = AVAudioSessionCategoryAmbient;
             } else if ([iosAudioCategory isEqualToString:@"soloAmbient"]) {
@@ -86,11 +90,18 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 category = AVAudioSessionCategoryPlayback;
             } else if ([iosAudioCategory isEqualToString:@"playAndRecord"]) {
                 category = AVAudioSessionCategoryPlayAndRecord;
+                // Favor the device speaker for "playAndRecord" but still advertise Bluetooth routes
+                // so accessories like AirPods remain selectable by the user.
+                options |= AVAudioSessionCategoryOptionDefaultToSpeaker;
+                options |= AVAudioSessionCategoryOptionAllowBluetooth;
+                if (@available(iOS 10.0, *)) {
+                    options |= AVAudioSessionCategoryOptionAllowBluetoothA2DP;
+                }
             }
             
             // Set the AVAudioSession category based on the string value
             NSError *error = nil;
-            [[AVAudioSession sharedInstance] setCategory:category error:&error];
+            [[AVAudioSession sharedInstance] setCategory:category withOptions:options error:&error];
             if (error) {
                 NSLog(@"Error setting AVAudioSession category: %@", error);
                 result([FlutterError errorWithCode:@"AVAudioSessionError"
@@ -257,6 +268,14 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 {
 #if TARGET_OS_IOS
     [[NSNotificationCenter defaultCenter] removeObserver:self name:AVAudioSessionRouteChangeNotification object:nil];
+    if (self.hasSpeakerOverride) {
+        NSError *error = nil;
+        [[AVAudioSession sharedInstance] overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:&error];
+        if (error) {
+            NSLog(@"Error clearing speaker override during cleanup: %@", error);
+        }
+        self.hasSpeakerOverride = NO;
+    }
 #endif
 
     if (_mAudioUnit != nil) {
@@ -303,6 +322,9 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 }
 
 - (void)ensureNotEarpiece {
+    // Guard against iOS selecting the built-in receiver when we really want full-volume playback.
+    // We still allow other routes (AirPods, AirPlay, wired headphones) by only forcing the speaker
+    // while the receiver is active and immediately undoing that override otherwise.
     AVAudioSessionRouteDescription *currentRoute = [AVAudioSession sharedInstance].currentRoute;
     BOOL isEarpiece = NO;
     for (AVAudioSessionPortDescription *output in currentRoute.outputs) {
@@ -314,20 +336,30 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     }
 
     if (isEarpiece) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if (!self.hasSpeakerOverride) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSError *error = nil;
+                [[AVAudioSession sharedInstance] overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&error];
+                if (error) {
+                    NSLog(@"Error overriding to speaker: %@", error);
+                } else {
+                    self.hasSpeakerOverride = YES;
+                    NSLog(@"Earpiece was selected, overriding to speaker.");
+                }
+            });
+        }
+    } else if (self.hasSpeakerOverride) {
+        // We've previously forced the speaker, but the active route is now something else
+        // (e.g. Bluetooth or headphones). Clear the override so iOS can honor that route.
+        dispatch_async(dispatch_get_main_queue(), ^{
             NSError *error = nil;
-            [[AVAudioSession sharedInstance] overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&error];
+            [[AVAudioSession sharedInstance] overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:&error];
             if (error) {
-                NSLog(@"Error overriding to speaker: %@", error);
+                NSLog(@"Error clearing speaker override when new route detected: %@", error);
             } else {
-                NSLog(@"Earpiece was selected, overriding to speaker.");
+                self.hasSpeakerOverride = NO;
             }
         });
-    } else {
-        // If not using earpiece, do nothing. Headphones, AirPlay, etc. will remain as is.
-        // Also, if previously overridden, we can revert if desired:
-        // But generally, calling overrideOutputAudioPort(.none) is only needed if we previously forced the speaker.
-        // If we always force speaker only when the earpiece is chosen, we do not need to revert explicitly.
     }
 }
 #endif
