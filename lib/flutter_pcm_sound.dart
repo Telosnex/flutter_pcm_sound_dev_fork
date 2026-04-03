@@ -134,11 +134,18 @@ class FlutterPcmSoundDelegatingToNative implements FlutterPcmSoundImpl {
 }
 
 class FlutterPcmSound {
-  static const isWeb = bool.fromEnvironment('dart.library.js_util');
-  static final _impl =
-      isWeb || !Platform.isWindows
-          ? FlutterPcmSoundDelegatingToNative()
-      : createWindowsImpl();
+  static const isWeb = bool.fromEnvironment('dart.library.js_interop');
+  static final _impl = _createImpl();
+
+  static FlutterPcmSoundImpl _createImpl() {
+    if (isWeb) return FlutterPcmSoundDelegatingToNative();
+    try {
+      if (Platform.isWindows) return createWindowsImpl();
+    } catch (_) {
+      // Platform may be unavailable (e.g. in test environments)
+    }
+    return FlutterPcmSoundDelegatingToNative();
+  }
 
 
   static Function(int)? onFeedSamplesCallback;
