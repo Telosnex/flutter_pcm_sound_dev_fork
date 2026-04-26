@@ -19,6 +19,8 @@ class FlutterPcmSoundPlugin {
   AudioContext? _audioContext;
   AudioWorkletNode? _workletNode;
   bool _didSetup = false;
+  bool _workletModuleLoaded = false;
+  Future<void>? _setupFuture;
   int _numChannels = 1;
   int _sampleRate = 44100;
   int _feedThreshold = 8000;
@@ -31,14 +33,14 @@ class FlutterPcmSoundPlugin {
         return true; // Logging handled by print statements as needed.
       case 'setup':
         final args = call.arguments as Map;
-        _sampleRate = args['sample_rate'] ?? _sampleRate;
-        _numChannels = args['num_channels'] ?? _numChannels;
+        _sampleRate = _readInt(args['sample_rate'], _sampleRate);
+        _numChannels = _readInt(args['num_channels'], _numChannels);
         await _initializeAudioWorklet();
         _didSetup = true;
         return true;
       case 'feed':
         if (!_didSetup) {
-          _handleMethodCall(MethodCall('setup', call.arguments));
+          await _handleMethodCall(MethodCall('setup', call.arguments));
         }
         final args = call.arguments as Map;
         final Uint8List buffer = args['buffer'];
@@ -51,7 +53,7 @@ class FlutterPcmSoundPlugin {
         return true;
       case 'setFeedThreshold':
         final args = call.arguments as Map;
-        _feedThreshold = args['feed_threshold'];
+        _feedThreshold = _readInt(args['feed_threshold'], _feedThreshold);
         _workletNode?.port.postMessage({
           'type': 'configThreshold',
           'feedThreshold': _feedThreshold
@@ -67,38 +69,67 @@ class FlutterPcmSoundPlugin {
     }
   }
 
-  Future<void> _initializeAudioWorklet() async {
+  Future<void> _initializeAudioWorklet() {
+    final existingSetup = _setupFuture;
+    if (existingSetup != null) {
+      return existingSetup;
+    }
+
+    final setupFuture = _doInitializeAudioWorklet();
+    _setupFuture = setupFuture;
+    return setupFuture.whenComplete(() {
+      _setupFuture = null;
+    });
+  }
+
+  Future<void> _doInitializeAudioWorklet() async {
+    if (_audioContext != null &&
+        _audioContext!.sampleRate.round() != _sampleRate) {
+      _cleanup();
+    }
+
     if (_audioContext == null) {
       _audioContext =
           AudioContext(AudioContextOptions(sampleRate: _sampleRate));
+      _workletModuleLoaded = false;
     }
 
-    final workletUrl = _createWorkletUrl();
-    try {
-      await _audioContext!.audioWorklet.addModule(workletUrl).toDart;
-    } finally {
-      // Clean up the Blob URL after it's loaded
-      URL.revokeObjectURL(workletUrl);
+    if (!_workletModuleLoaded) {
+      final workletUrl = _createWorkletUrl();
+      try {
+        await _audioContext!.audioWorklet.addModule(workletUrl).toDart;
+        _workletModuleLoaded = true;
+      } finally {
+        // Clean up the Blob URL after it's loaded.
+        URL.revokeObjectURL(workletUrl);
+      }
     }
-    _workletNode = AudioWorkletNode(_audioContext!, 'pcm-processor');
 
-    _workletNode!.port
-        .postMessage({'type': 'config', 'numChannels': _numChannels}.toJSBox);
-    _workletNode!.port.postMessage(
-        {'type': 'configThreshold', 'feedThreshold': _feedThreshold}.toJSBox);
+    if (_workletNode == null) {
+      _workletNode = AudioWorkletNode(_audioContext!, 'pcm-processor');
+      _workletNode!.port.onmessage =
+          ((MessageEvent event) => _onMessage(event)).toJS;
+      _workletNode!.connect(_audioContext!.destination);
+    }
 
-    _workletNode!.port.onmessage =
-        ((MessageEvent event) => _onMessage(event)).toJS;
-    _workletNode!.connect(_audioContext!.destination);
+    _postConfig();
+
     await _audioContext!.resume().toDart;
     print("[PCM] AudioWorklet setup complete and stable.");
+  }
+
+  void _postConfig() {
+    _workletNode?.port
+        .postMessage({'type': 'config', 'numChannels': _numChannels}.toJSBox);
+    _workletNode?.port.postMessage(
+        {'type': 'configThreshold', 'feedThreshold': _feedThreshold}.toJSBox);
   }
 
   void _onMessage(MessageEvent event) {
     final data = event.data?.dartify();
     if (data is Map) {
       if (data['type'] == 'requestMoreData') {
-        final remainingFrames = data['remainingFrames'] as int;
+        final remainingFrames = _readInt(data['remainingFrames'], 0);
         _channel.invokeMethod(
             'OnFeedSamples', {'remaining_frames': remainingFrames});
       } else if (data['type'] == 'configured') {
@@ -116,6 +147,8 @@ class FlutterPcmSoundPlugin {
       _audioContext!.close();
       _audioContext = null;
     }
+    _workletModuleLoaded = false;
+    _setupFuture = null;
     _didSetup = false;
     print("[PCM] Cleaned up audio resources. System stable.");
   }
@@ -127,6 +160,22 @@ String _createWorkletUrl() {
     BlobPropertyBag(type: 'application/javascript'),
   );
   return URL.createObjectURL(blob);
+}
+
+int _readInt(Object? value, int fallback) {
+  if (value == null) {
+    return fallback;
+  }
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.round();
+  }
+  if (value is String) {
+    return int.tryParse(value) ?? double.tryParse(value)?.round() ?? fallback;
+  }
+  return fallback;
 }
 
 const _workletJs = '''
@@ -223,5 +272,13 @@ class PCMProcessor extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor('pcm-processor', PCMProcessor);
+try {
+  registerProcessor('pcm-processor', PCMProcessor);
+} catch (error) {
+  const message = error && (error.message || String(error));
+  if (!(error && error.name === 'NotSupportedError') &&
+      !(message && message.includes('already registered'))) {
+    throw error;
+  }
+}
 ''';
